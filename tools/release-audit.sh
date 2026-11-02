@@ -2,7 +2,7 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 : "${VITASDK:?Set VITASDK before auditing}"
-ffmpeg="${VITA_SW_DECODER_FFMPEG_ROOT:-$repo_root/build/deps/ffmpeg-vita-sw}"
+ffmpeg="${VITA_SW_VIDEO_DECODER_FFMPEG_ROOT:-$repo_root/build/deps/ffmpeg-vita-sw}"
 for file in "$repo_root/LICENSE" "$repo_root/THIRD_PARTY_NOTICES.md" \
   "$repo_root/DEPENDENCIES.lock" \
   "$ffmpeg/share/licenses/FFmpeg-LGPL-2.1.txt" \
@@ -17,4 +17,4 @@ grep -q 'ff_h264_decoder' "$nm_output" || { echo "software H.264 is missing" >&2
 if grep -q 'h264_vita' "$nm_output"; then
   echo "hardware H.264 leaked into the software-only package" >&2; exit 1
 fi
-echo "vita-sw-decoder release audit passed"
+echo "vita-sw-video-decoder release audit passed"

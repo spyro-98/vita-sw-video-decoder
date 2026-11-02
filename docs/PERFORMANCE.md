@@ -1,4 +1,4 @@
-# vita-sw-decoder: performance and evidence
+# vita-sw-video-decoder: performance and evidence
 
 Source baseline is ABI 2.0.0; app integration 1.4.1. No new runtime algorithm,
 codec, clock default or battery measurement is introduced by this doc refresh.
@@ -17,8 +17,8 @@ codec, clock default or battery measurement is introduced by this doc refresh.
 
 | Option | Default | Effect / boundary |
 | --- | --- | --- |
-| VITA_SW_DECODER_CPU_THREADS | 3 | 1..3 workers for seekable H.264; forward-only input forces one |
-| VITA_SW_DECODER_PLANAR_UPLOAD | OFF | Optional copied YUV420P3 GXM upload; requires comparative console tests |
+| VITA_SW_VIDEO_DECODER_CPU_THREADS | 3 | 1..3 workers for seekable H.264; forward-only input forces one |
+| VITA_SW_VIDEO_DECODER_PLANAR_UPLOAD | OFF | Optional copied YUV420P3 GXM upload; requires comparative console tests |
 
 Normal output is copied NV12/P2 sampled as YVU420P2. Planar output changes plane
 layout/upload, not the H.264 codec. CPU zero-copy remains disabled: FFmpeg frame

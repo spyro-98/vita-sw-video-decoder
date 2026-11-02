@@ -1,4 +1,4 @@
-# vita-sw-decoder: runtime contract
+# vita-sw-video-decoder: runtime contract
 
 Reviewed against the current 2.0.0 source for VitaMediaDeck 1.4.1, 23 October 2026.
 This package owns demux, H.264/AAC decoding, timing and surfaces. The app owns UI,
@@ -21,9 +21,9 @@ clear a caller's cancellation flag; cancellation suppresses expensive recovery.
 ## Presentation and restart
 
 Use the ordering in [the example](../examples/local_file.c): start frame, present,
-end drawing, `vita2d_wait_rendering_done()`, `vita_sw_decoder_render_complete()`,
+end drawing, `vita2d_wait_rendering_done()`, `vita_sw_video_decoder_render_complete()`,
 then swap. Surface release must follow the GXM fence. Before background restart
-follow the app's owner-side fence and `vita_sw_decoder_prepare_background_restart()`.
+follow the app's owner-side fence and `vita_sw_video_decoder_prepare_background_restart()`.
 No worker may free a surface still referenced by a submitted draw.
 
 Finite-file startup/resume/seek use the selected H.264 stream as byte-index
@@ -44,7 +44,7 @@ clock ownership without dropping the remaining video tail.
 
 ## Live API
 
-`vita_sw_decoder_open_live()` is opt-in, not a replacement for file open. Two
+`vita_sw_video_decoder_open_live()` is opt-in, not a replacement for file open. Two
 forward-only MPEG-TS cursors must start at the same retained segment; starvation
 blocks cooperatively, rather than reporting EOF. App transport bounds memory and
 waiting. Video and audio share the demux PTS origin. Compatible H.264/AAC is

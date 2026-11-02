@@ -1,5 +1,6 @@
-#include "vita_sw_decoder.h"
-#include "vita_sw_decoder_live.h"
+#include <vita_audio_formats.h>
+#include "vita_sw_video_decoder.h"
+#include "vita_sw_video_decoder_live.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -14,28 +15,28 @@
 #include <libavutil/mathematics.h>
 
 #include "decoder_runtime.h"
-#include "internal/elementary_audio.h"
-#include "internal/audio_gain.h"
+#include <vita_audio_playback.h>
+#include <vita_audio_gain.h>
 #include "internal/software_video.h"
 #include "internal/input_timing.h"
 #include "module_log.h"
 
-#ifndef VITA_SW_DECODER_HAS_H264_VITA
-#define VITA_SW_DECODER_HAS_H264_VITA 0
+#ifndef VITA_SW_VIDEO_DECODER_HAS_H264_VITA
+#define VITA_SW_VIDEO_DECODER_HAS_H264_VITA 0
 #endif
 
-#define VITA_SW_DECODER_AVIO_BUFFER_SIZE (64 * 1024)
-#define VITA_SW_DECODER_CLOCK_WINDOW_US 32000ULL
-#define VITA_SW_DECODER_OPEN_DEADLINE_US (5ULL * 1000ULL * 1000ULL)
-#define VITA_SW_DECODER_AUDIO_READY_DEADLINE_US (1500ULL * 1000ULL)
-#define VITA_SW_DECODER_IO_STOP_GRACE_US (30ULL * 1000ULL)
-#define VITA_SW_DECODER_AUDIO_START_THREAD_PRIORITY 0x10000100
-#define VITA_SW_DECODER_AUDIO_START_THREAD_STACK 0x40000
-#define VITA_SW_DECODER_SEEK_OVERSHOOT_US (2ULL * 1000ULL * 1000ULL)
-#define VITA_SW_DECODER_AV_LANDING_TOLERANCE_US (250ULL * 1000ULL)
+#define VITA_SW_VIDEO_DECODER_AVIO_BUFFER_SIZE (64 * 1024)
+#define VITA_SW_VIDEO_DECODER_CLOCK_WINDOW_US 32000ULL
+#define VITA_SW_VIDEO_DECODER_OPEN_DEADLINE_US (5ULL * 1000ULL * 1000ULL)
+#define VITA_SW_VIDEO_DECODER_AUDIO_READY_DEADLINE_US (1500ULL * 1000ULL)
+#define VITA_SW_VIDEO_DECODER_IO_STOP_GRACE_US (30ULL * 1000ULL)
+#define VITA_SW_VIDEO_DECODER_AUDIO_START_THREAD_PRIORITY 0x10000100
+#define VITA_SW_VIDEO_DECODER_AUDIO_START_THREAD_STACK 0x40000
+#define VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US (2ULL * 1000ULL * 1000ULL)
+#define VITA_SW_VIDEO_DECODER_AV_LANDING_TOLERANCE_US (250ULL * 1000ULL)
 
 typedef struct {
-	VitaSwDecoderStreamHandle stream;
+	VitaSwVideoDecoderStreamHandle stream;
 	AVIOContext *avio;
 	AVFormatContext *format;
 	volatile int *cancel;
@@ -51,25 +52,25 @@ typedef struct {
 	volatile int io_active;
 	volatile int abort_invoked;
 	volatile unsigned int cancel_serial;
-} VitaSwDecoderInput;
+} VitaSwVideoDecoderInput;
 
-static int input_interrupted(const VitaSwDecoderInput *input) {
+static int input_interrupted(const VitaSwVideoDecoderInput *input) {
 	return !input || input->transport_cancel || input->abort_invoked ||
 	       (input->cancel && *input->cancel) ||
 	       (input->deadline_us &&
 	        sceKernelGetProcessTimeWide() >= input->deadline_us);
 }
 
-static void input_io_lock(VitaSwDecoderInput *input) {
+static void input_io_lock(VitaSwVideoDecoderInput *input) {
 	while (__sync_lock_test_and_set(&input->io_lock, 1))
 		sceKernelDelayThread(100);
 }
 
-static void input_io_unlock(VitaSwDecoderInput *input) {
+static void input_io_unlock(VitaSwVideoDecoderInput *input) {
 	__sync_lock_release(&input->io_lock);
 }
 
-static int input_begin_io(VitaSwDecoderInput *input) {
+static int input_begin_io(VitaSwVideoDecoderInput *input) {
 	if (!input) return 0;
 	input_io_lock(input);
 	if (input_interrupted(input)) {
@@ -82,7 +83,7 @@ static int input_begin_io(VitaSwDecoderInput *input) {
 	return 1;
 }
 
-static void input_end_io(VitaSwDecoderInput *input) {
+static void input_end_io(VitaSwVideoDecoderInput *input) {
 	if (!input) return;
 	input_io_lock(input);
 	input->io_active = 0;
@@ -90,7 +91,7 @@ static void input_end_io(VitaSwDecoderInput *input) {
 	input_io_unlock(input);
 }
 
-static int input_abort_active_io(VitaSwDecoderInput *input) {
+static int input_abort_active_io(VitaSwVideoDecoderInput *input) {
 	if (!input) return 0;
 	input_io_lock(input);
 	if (input->io_active && !input->abort_invoked && input->stream.abort) {
@@ -105,7 +106,7 @@ static int input_abort_active_io(VitaSwDecoderInput *input) {
 	return poisoned;
 }
 
-static void input_publish_cancel(VitaSwDecoderInput *input) {
+static void input_publish_cancel(VitaSwVideoDecoderInput *input) {
 	if (!input) return;
 	input_io_lock(input);
 	input->transport_cancel = 1;
@@ -114,12 +115,12 @@ static void input_publish_cancel(VitaSwDecoderInput *input) {
 	input_io_unlock(input);
 }
 
-static int input_cancel_and_abort(VitaSwDecoderInput *input) {
+static int input_cancel_and_abort(VitaSwVideoDecoderInput *input) {
 	input_publish_cancel(input);
 	return input_abort_active_io(input);
 }
 
-static int input_abort_after_grace(VitaSwDecoderInput *input,
+static int input_abort_after_grace(VitaSwVideoDecoderInput *input,
 	                               int worker_started,
 	                               volatile int *thread_done,
 	                               uint64_t deadline_us) {
@@ -132,7 +133,7 @@ static int input_abort_after_grace(VitaSwDecoderInput *input,
 	return input ? input->abort_invoked : 0;
 }
 
-static void input_clear_cancel_if_reusable(VitaSwDecoderInput *input) {
+static void input_clear_cancel_if_reusable(VitaSwVideoDecoderInput *input) {
 	if (!input) return;
 	input_io_lock(input);
 	if (!input->abort_invoked && !(input->cancel && *input->cancel))
@@ -141,14 +142,14 @@ static void input_clear_cancel_if_reusable(VitaSwDecoderInput *input) {
 	input_io_unlock(input);
 }
 
-struct VitaSwDecoderPlayer {
-	VitaSwDecoderPlayerConfig config;
+struct VitaSwVideoDecoderPlayer {
+	VitaSwVideoDecoderPlayerConfig config;
 	int live_input;
 	uint32_t live_audio_sample_rate, live_audio_channels;
-	VitaSwDecoderInput video_input;
-	VitaSwDecoderInput audio_input;
+	VitaSwVideoDecoderInput video_input;
+	VitaSwVideoDecoderInput audio_input;
 	SoftwareVideoState video;
-	ElementaryAudioState audio;
+	VitaAudioPlayback audio;
 	volatile int local_cancel;
 	volatile int *cancel;
 	volatile int start_gate;
@@ -161,8 +162,8 @@ struct VitaSwDecoderPlayer {
 	int clock_started;
 	int has_audio;
 	int audio_clock_handed_off;
-	VitaSwDecoderTrackInfo audio_tracks[VITA_SW_DECODER_MAX_AUDIO_TRACKS];
-	VitaSwDecoderTrackInfo subtitle_tracks[VITA_SW_DECODER_MAX_SUBTITLE_TRACKS];
+	VitaSwVideoDecoderTrackInfo audio_tracks[VITA_SW_VIDEO_DECODER_MAX_AUDIO_TRACKS];
+	VitaSwVideoDecoderTrackInfo subtitle_tracks[VITA_SW_VIDEO_DECODER_MAX_SUBTITLE_TRACKS];
 	int audio_track_count;
 	int subtitle_track_count;
 	volatile int audio_operation_lock;
@@ -172,16 +173,16 @@ struct VitaSwDecoderPlayer {
 	volatile int video_gpu_fenced;
 };
 
-static void audio_operation_lock(VitaSwDecoderPlayer *player) {
+static void audio_operation_lock(VitaSwVideoDecoderPlayer *player) {
 	while (__sync_lock_test_and_set(&player->audio_operation_lock, 1))
 		sceKernelDelayThread(100);
 }
 
-static void audio_operation_unlock(VitaSwDecoderPlayer *player) {
+static void audio_operation_unlock(VitaSwVideoDecoderPlayer *player) {
 	__sync_lock_release(&player->audio_operation_lock);
 }
 
-static int audio_operation_begin(VitaSwDecoderPlayer *player) {
+static int audio_operation_begin(VitaSwVideoDecoderPlayer *player) {
 	audio_operation_lock(player);
 	if (player->audio_operation_active) {
 		audio_operation_unlock(player);
@@ -200,7 +201,7 @@ static int audio_operation_begin(VitaSwDecoderPlayer *player) {
 	return 1;
 }
 
-static void audio_operation_end(VitaSwDecoderPlayer *player,
+static void audio_operation_end(VitaSwVideoDecoderPlayer *player,
 	                            int commit_audio) {
 	audio_operation_lock(player);
 	input_clear_cancel_if_reusable(&player->audio_input);
@@ -214,14 +215,14 @@ static void audio_operation_end(VitaSwDecoderPlayer *player,
 	audio_operation_unlock(player);
 }
 
-static int audio_operation_cancelled(const VitaSwDecoderPlayer *player,
+static int audio_operation_cancelled(const VitaSwVideoDecoderPlayer *player,
 	                                 volatile int *operation_cancel) {
 	return player->audio_operation_interrupted ||
 	       (operation_cancel && *operation_cancel) ||
 	       (player->cancel && *player->cancel);
 }
 
-static int audio_operation_commit(VitaSwDecoderPlayer *player,
+static int audio_operation_commit(VitaSwVideoDecoderPlayer *player,
 	                              volatile int *operation_cancel) {
 	audio_operation_lock(player);
 	if (audio_operation_cancelled(player, operation_cancel)) {
@@ -243,7 +244,7 @@ static int audio_operation_commit(VitaSwDecoderPlayer *player,
 	return 1;
 }
 
-static void audio_operation_begin_rollback(VitaSwDecoderPlayer *player) {
+static void audio_operation_begin_rollback(VitaSwVideoDecoderPlayer *player) {
 	audio_operation_lock(player);
 	/* The caller's operation flag describes the failed forward change and may
 	 * remain set after the UI dismisses its modal. Consume that phase here and
@@ -255,16 +256,16 @@ static void audio_operation_begin_rollback(VitaSwDecoderPlayer *player) {
 	audio_operation_unlock(player);
 }
 
-int vita_sw_decoder_prepare_runtime(void) {
-	return vita_sw_decoder_runtime_prepare();
+int vita_sw_video_decoder_prepare_runtime(void) {
+	return vita_sw_video_decoder_runtime_prepare();
 }
 
-const char *vita_sw_decoder_backend_name(void) {
+const char *vita_sw_video_decoder_backend_name(void) {
 	return "software";
 }
 
 static int stream_avio_read(void *opaque, uint8_t *buffer, int size) {
-	VitaSwDecoderInput *input = (VitaSwDecoderInput *)opaque;
+	VitaSwVideoDecoderInput *input = (VitaSwVideoDecoderInput *)opaque;
 	if (!input || !input->stream.read || !input_begin_io(input)) return AVERROR_EXIT;
 	int ret = input->stream.read(input->stream.opaque, buffer, (size_t)size);
 	input_end_io(input);
@@ -274,7 +275,7 @@ static int stream_avio_read(void *opaque, uint8_t *buffer, int size) {
 }
 
 static int64_t stream_avio_seek(void *opaque, int64_t offset, int whence) {
-	VitaSwDecoderInput *input = (VitaSwDecoderInput *)opaque;
+	VitaSwVideoDecoderInput *input = (VitaSwVideoDecoderInput *)opaque;
 	if (input_interrupted(input)) return AVERROR_EXIT;
 	if (whence == AVSEEK_SIZE) return input->stream.size;
 	if (!input->stream.seek) return AVERROR(ENOSYS);
@@ -286,18 +287,12 @@ static int64_t stream_avio_seek(void *opaque, int64_t offset, int whence) {
 }
 
 static int interrupt_cb(void *opaque) {
-	VitaSwDecoderInput *input = (VitaSwDecoderInput *)opaque;
+	VitaSwVideoDecoderInput *input = (VitaSwVideoDecoderInput *)opaque;
 	return input_interrupted(input);
 }
 
-static int playable_aac_stream(const AVStream *stream) {
-	if (!stream || stream->codecpar->codec_type != AVMEDIA_TYPE_AUDIO ||
-	    stream->codecpar->codec_id != AV_CODEC_ID_AAC) return 0;
-	int channels = stream->codecpar->ch_layout.nb_channels;
-	/* Known multichannel AAC is outside sceAudiodec's contract. Zero remains a
-	 * valid candidate for ADTS inputs: elementary_audio resolves channels/rate
-	 * from the first access unit when container metadata is absent. */
-	return channels >= 0 && channels <= 2;
+static int playable_audio_stream(const AVStream *stream) {
+ return stream&&vmd_audio_parameters_playable(stream->codecpar);
 }
 
 static int text_subtitle_codec(enum AVCodecID codec) {
@@ -359,7 +354,7 @@ static void copy_metadata(char *out, size_t out_size,
 	copy_utf8_text(out, out_size, entry->value);
 }
 
-static void fill_track_info(VitaSwDecoderTrackInfo *out,
+static void fill_track_info(VitaSwVideoDecoderTrackInfo *out,
 	                        const AVStream *stream, int stream_index) {
 	memset(out, 0, sizeof(*out));
 	out->stream_index = stream_index;
@@ -373,7 +368,7 @@ static void fill_track_info(VitaSwDecoderTrackInfo *out,
 	               avcodec_get_name(stream->codecpar->codec_id));
 }
 
-static void clear_track_snapshot(VitaSwDecoderPlayer *player) {
+static void clear_track_snapshot(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	memset(player->audio_tracks, 0, sizeof(player->audio_tracks));
 	memset(player->subtitle_tracks, 0, sizeof(player->subtitle_tracks));
@@ -381,20 +376,20 @@ static void clear_track_snapshot(VitaSwDecoderPlayer *player) {
 	player->subtitle_track_count = 0;
 }
 
-static void snapshot_tracks(VitaSwDecoderPlayer *player,
+static void snapshot_tracks(VitaSwVideoDecoderPlayer *player,
 	                        const AVFormatContext *format) {
 	clear_track_snapshot(player);
 	for (unsigned int i = 0; format && i < format->nb_streams; i++) {
 		const AVStream *stream = format->streams[i];
 		const AVCodecParameters *params = stream->codecpar;
-		if (playable_aac_stream(stream) &&
-		    player->audio_track_count < VITA_SW_DECODER_MAX_AUDIO_TRACKS) {
+		if (playable_audio_stream(stream) &&
+		    player->audio_track_count < VITA_SW_VIDEO_DECODER_MAX_AUDIO_TRACKS) {
 			fill_track_info(&player->audio_tracks[player->audio_track_count++],
 			                stream, (int)i);
 		} else if (params->codec_type == AVMEDIA_TYPE_SUBTITLE &&
 		           text_subtitle_codec(params->codec_id) &&
 		           player->subtitle_track_count <
-		               VITA_SW_DECODER_MAX_SUBTITLE_TRACKS) {
+		               VITA_SW_VIDEO_DECODER_MAX_SUBTITLE_TRACKS) {
 			fill_track_info(
 			    &player->subtitle_tracks[player->subtitle_track_count++],
 			    stream, (int)i);
@@ -419,7 +414,7 @@ static int playback_streams_ready(const AVFormatContext *format,
 				return 0;
 			have_video = 1;
 		} else if (params->codec_type == AVMEDIA_TYPE_AUDIO &&
-		           params->codec_id == AV_CODEC_ID_AAC &&
+		           vmd_audio_parameters_playable(params) &&
 		           (params->sample_rate <= 0 ||
 		            params->ch_layout.nb_channels <= 0 ||
 		            stream->time_base.num <= 0 || stream->time_base.den <= 0)) {
@@ -440,15 +435,15 @@ static int indexed_container(const AVFormatContext *format) {
 	                strstr(name, "webm") || strstr(name, "avi"));
 }
 
-static void stream_handle_close(VitaSwDecoderStreamHandle *stream) {
+static void stream_handle_close(VitaSwVideoDecoderStreamHandle *stream) {
 	if (!stream) return;
 	if (stream->close) stream->close(stream->opaque);
 	memset(stream, 0, sizeof(*stream));
 }
 
-static void input_close(VitaSwDecoderInput *input) {
+static void input_close(VitaSwVideoDecoderInput *input) {
 	if (!input) return;
-	VitaSwDecoderStreamHandle detached = {0};
+	VitaSwVideoDecoderStreamHandle detached = {0};
 	unsigned int close_cancel_serial = 0;
 	/* Detach the complete handle while stop uses this same lock. Later abort
 	 * requests then see no callback/opaque pair, while close owns the detached
@@ -481,8 +476,8 @@ static void input_close(VitaSwDecoderInput *input) {
 	input_io_unlock(input);
 }
 
-static int input_open(VitaSwDecoderInput *input,
-	                  const VitaSwDecoderStreamFactory *factory,
+static int input_open(VitaSwVideoDecoderInput *input,
+	                  const VitaSwVideoDecoderStreamFactory *factory,
 	                  volatile int *cancel, const char *label,
 	                  int require_track_metadata, int live) {
 	if (!input || !factory || (!factory->open && !factory->open_with_cancel))
@@ -497,7 +492,7 @@ static int input_open(VitaSwDecoderInput *input,
 	__sync_synchronize();
 	input_io_unlock(input);
 	if (input_interrupted(input)) return AVERROR_EXIT;
-	VitaSwDecoderStreamHandle opened = {0};
+	VitaSwVideoDecoderStreamHandle opened = {0};
 	int ret = factory->open_with_cancel
 	        ? factory->open_with_cancel(factory->opaque,
 	                                    &input->transport_cancel,
@@ -524,12 +519,12 @@ static int input_open(VitaSwDecoderInput *input,
 		input_close(input);
 		return AVERROR_EXIT;
 	}
-	unsigned char *buffer = av_malloc(VITA_SW_DECODER_AVIO_BUFFER_SIZE);
+	unsigned char *buffer = av_malloc(VITA_SW_VIDEO_DECODER_AVIO_BUFFER_SIZE);
 	if (!buffer) {
 		input_close(input);
 		return AVERROR(ENOMEM);
 	}
-	input->avio = avio_alloc_context(buffer, VITA_SW_DECODER_AVIO_BUFFER_SIZE, 0,
+	input->avio = avio_alloc_context(buffer, VITA_SW_VIDEO_DECODER_AVIO_BUFFER_SIZE, 0,
 	                                 input, stream_avio_read, NULL,
 	                                 live ? NULL : stream_avio_seek);
 	if (!input->avio) {
@@ -549,7 +544,7 @@ static int input_open(VitaSwDecoderInput *input,
 	input->format->interrupt_callback.callback = interrupt_cb;
 	input->format->interrupt_callback.opaque = input;
 	input->deadline_us = sceKernelGetProcessTimeWide() +
-	                     VITA_SW_DECODER_OPEN_DEADLINE_US;
+	                     VITA_SW_VIDEO_DECODER_OPEN_DEADLINE_US;
 	input->format->probesize = 1024 * 1024;
 	input->format->max_analyze_duration = 2 * AV_TIME_BASE;
 	if (live) {
@@ -641,7 +636,7 @@ static int input_open(VitaSwDecoderInput *input,
 	return 0;
 }
 
-static int reopen_audio_input(VitaSwDecoderPlayer *player,
+static int reopen_audio_input(VitaSwVideoDecoderPlayer *player,
 	                          volatile int *operation_cancel,
 	                          const char *label) {
 	if (!player) return AVERROR(EINVAL);
@@ -656,10 +651,11 @@ static int reopen_audio_input(VitaSwDecoderPlayer *player,
 	                  player->cancel, label ? label : "audio-reopen", 0, 0);
 }
 
-static void stop_audio_candidate(VitaSwDecoderPlayer *player);
+static void stop_audio_candidate(VitaSwVideoDecoderPlayer *player);
 
 typedef struct {
-	ElementaryAudioState *audio;
+	VitaAudioPlayback *audio;
+ const VitaAudioPlaybackDriver *driver;
 	AVFormatContext *format;
 	int stream_index;
 	uint64_t position_ms;
@@ -667,7 +663,7 @@ typedef struct {
 	volatile int *start_gate;
 	volatile int done;
 	int result;
-} VitaSwDecoderAudioStartJob;
+} VitaSwVideoDecoderAudioStartJob;
 
 static int audio_start_may_read(const AVFormatContext *format,
 	                            int stream_index) {
@@ -681,27 +677,28 @@ static int audio_start_may_read(const AVFormatContext *format,
 
 static int audio_start_thread(SceSize args, void *argp) {
 	(void)args;
-	VitaSwDecoderAudioStartJob *job =
-	    *(VitaSwDecoderAudioStartJob **)argp;
-	job->result = vita_sw_elementary_audio_start(
-	    job->audio, job->format, job->stream_index, job->position_ms,
+	VitaSwVideoDecoderAudioStartJob *job =
+	    *(VitaSwVideoDecoderAudioStartJob **)argp;
+	job->result = vita_audio_playback_start(
+	    job->audio, job->driver, job->format, job->stream_index, job->position_ms,
 	    job->cancel, job->start_gate);
 	__sync_synchronize();
 	job->done = 1;
 	return 0;
 }
 
-static int start_audio_candidate(VitaSwDecoderPlayer *player,
+static int start_audio_candidate(VitaSwVideoDecoderPlayer *player,
 	                             int stream_index, uint64_t position_ms,
 	                             volatile int *operation_cancel,
 	                             uint64_t deadline_us) {
 	if (!audio_start_may_read(player->audio_input.format, stream_index))
-		return vita_sw_elementary_audio_start(
-		    &player->audio, player->audio_input.format, stream_index,
+		return vita_audio_playback_start(
+		    &player->audio, player->config.audio_driver, player->audio_input.format, stream_index,
 		    position_ms, player->cancel, &player->start_gate);
 
-	VitaSwDecoderAudioStartJob job = {
+	VitaSwVideoDecoderAudioStartJob job = {
 		.audio = &player->audio,
+        .driver = player->config.audio_driver,
 		.format = player->audio_input.format,
 		.stream_index = stream_index,
 		.position_ms = position_ms,
@@ -710,11 +707,11 @@ static int start_audio_candidate(VitaSwDecoderPlayer *player,
 		.result = AVERROR(EINPROGRESS)
 	};
 	SceUID thid = sceKernelCreateThread(
-	    "VitaSwDecoderAudioStart", audio_start_thread,
-	    VITA_SW_DECODER_AUDIO_START_THREAD_PRIORITY,
-	    VITA_SW_DECODER_AUDIO_START_THREAD_STACK, 0, 0, NULL);
+	    "VitaSwVideoDecoderAudioStart", audio_start_thread,
+	    VITA_SW_VIDEO_DECODER_AUDIO_START_THREAD_PRIORITY,
+	    VITA_SW_VIDEO_DECODER_AUDIO_START_THREAD_STACK, 0, 0, NULL);
 	if (thid < 0) return thid;
-	VitaSwDecoderAudioStartJob *job_ptr = &job;
+	VitaSwVideoDecoderAudioStartJob *job_ptr = &job;
 	int ret = sceKernelStartThread(thid, sizeof(job_ptr), &job_ptr);
 	if (ret < 0) {
 		sceKernelDeleteThread(thid);
@@ -812,7 +809,7 @@ static uint64_t stream_logical_end_ms(const AVFormatContext *format,
 	return (logical_end_us + 999ULL) / 1000ULL;
 }
 
-static int audio_eof_expected_at(const VitaSwDecoderPlayer *player,
+static int audio_eof_expected_at(const VitaSwVideoDecoderPlayer *player,
 	                             int audio_index, uint64_t position_ms) {
 	if (!player) return 0;
 	uint64_t end_ms = stream_logical_end_ms(player->audio_input.format,
@@ -820,10 +817,10 @@ static int audio_eof_expected_at(const VitaSwDecoderPlayer *player,
 	if (!end_ms) end_ms = player->duration_ms;
 	if (!end_ms || position_ms >= end_ms) return end_ms != 0;
 	uint64_t remaining_ms = end_ms - position_ms;
-	return remaining_ms <= VITA_SW_DECODER_SEEK_OVERSHOOT_US / 1000ULL;
+	return remaining_ms <= VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US / 1000ULL;
 }
 
-static void close_session(VitaSwDecoderPlayer *player) {
+static void close_session(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	__atomic_store_n(&player->video.stop,1,__ATOMIC_RELEASE);
 	player->audio.stop = 1;
@@ -837,7 +834,7 @@ static void close_session(VitaSwDecoderPlayer *player) {
 			vita_sw_software_video_join(&player->video);
 	}
 	if (player->audio.started || player->audio.decoder_ready || player->audio.port_open)
-		vita_sw_elementary_audio_join(&player->audio);
+		vita_audio_playback_join(&player->audio);
 	input_close(&player->audio_input);
 	input_close(&player->video_input);
 	clear_track_snapshot(player);
@@ -868,7 +865,7 @@ static void isolate_input_stream(AVFormatContext *format, int stream_index) {
 		                          ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
 }
 
-static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
+static int seek_input_ms(VitaSwVideoDecoderInput *input, int stream_index,
 	                     uint64_t position_ms) {
 	if (!input || !input->format || stream_index < 0 ||
 	    (unsigned int)stream_index >= input->format->nb_streams)
@@ -916,22 +913,22 @@ static int seek_input_ms(VitaSwDecoderInput *input, int stream_index,
 	return ret;
 }
 
-static void stop_audio_candidate(VitaSwDecoderPlayer *player) {
+static void stop_audio_candidate(VitaSwVideoDecoderPlayer *player) {
 	player->audio.stop = 1;
 	__sync_synchronize();
 	input_publish_cancel(&player->audio_input);
 	uint64_t stop_deadline = sceKernelGetProcessTimeWide() +
-	                         VITA_SW_DECODER_IO_STOP_GRACE_US;
+	                         VITA_SW_VIDEO_DECODER_IO_STOP_GRACE_US;
 	input_abort_after_grace(&player->audio_input, player->audio.started,
 	                        &player->audio.thread_done, stop_deadline);
 	if (player->audio.started || player->audio.decoder_ready ||
 	    player->audio.port_open)
-		vita_sw_elementary_audio_join(&player->audio);
+		vita_audio_playback_join(&player->audio);
 	input_clear_cancel_if_reusable(&player->audio_input);
 	memset(&player->audio, 0, sizeof(player->audio));
 }
 
-static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
+static int restart_audio_track(VitaSwVideoDecoderPlayer *player, int audio_track,
 	                           uint64_t position_ms,
 	                           volatile int *operation_cancel,
 	                           int require_initial_packet) {
@@ -941,11 +938,11 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	__sync_synchronize();
 	input_publish_cancel(&player->audio_input);
 	uint64_t stop_deadline = sceKernelGetProcessTimeWide() +
-	                         VITA_SW_DECODER_IO_STOP_GRACE_US;
+	                         VITA_SW_VIDEO_DECODER_IO_STOP_GRACE_US;
 	input_abort_after_grace(&player->audio_input, player->audio.started,
 	                        &player->audio.thread_done, stop_deadline);
 	if (player->audio.started || player->audio.decoder_ready || player->audio.port_open)
-		vita_sw_elementary_audio_join(&player->audio);
+		vita_audio_playback_join(&player->audio);
 	uint64_t joined_us = sceKernelGetProcessTimeWide();
 	memset(&player->audio, 0, sizeof(player->audio));
 	player->has_audio = 0;
@@ -961,7 +958,7 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	if (audio_index >= 0 &&
 	    (!player->video_input.format ||
 	     (unsigned int)audio_index >= player->video_input.format->nb_streams ||
-	     !playable_aac_stream(player->video_input.format->streams[audio_index])))
+	     !playable_audio_stream(player->video_input.format->streams[audio_index])))
 		audio_index = -1;
 	if (audio_index < 0) {
 		log_printf("decoder audio switch: join=%llu ms total=%llu ms ret=%d\n",
@@ -974,7 +971,7 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	                             "audio-track-reopen");
 	if (ret >= 0 &&
 	    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-	     !playable_aac_stream(player->audio_input.format->streams[audio_index])))
+	     !playable_audio_stream(player->audio_input.format->streams[audio_index])))
 		ret = AVERROR_DECODER_NOT_FOUND;
 	if (ret >= 0 && position_ms > 0)
 		ret = seek_input_ms(&player->audio_input, audio_index, position_ms);
@@ -991,7 +988,7 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 		return ret;
 	}
 	uint64_t readiness_deadline = sceKernelGetProcessTimeWide() +
-	                              VITA_SW_DECODER_AUDIO_READY_DEADLINE_US;
+	                              VITA_SW_VIDEO_DECODER_AUDIO_READY_DEADLINE_US;
 	ret = start_audio_candidate(player, audio_index, position_ms,
 	                            operation_cancel, readiness_deadline);
 	if (ret < 0) {
@@ -1026,21 +1023,21 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 		                    : AVERROR(ETIMEDOUT);
 		log_printf("decoder audio switch: no AU at %llu ms ret=%d track=%d deadline=%u ms",
 		           (unsigned long long)position_ms, readiness_ret, audio_track,
-		           (unsigned)(VITA_SW_DECODER_AUDIO_READY_DEADLINE_US / 1000ULL));
+		           (unsigned)(VITA_SW_VIDEO_DECODER_AUDIO_READY_DEADLINE_US / 1000ULL));
 		stop_audio_candidate(player);
 		return readiness_ret;
 	}
 	if (require_initial_packet && player->audio.first_packet_pts_valid &&
 	    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL >
-	        position_ms * 1000ULL + VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+	        position_ms * 1000ULL + VITA_SW_VIDEO_DECODER_AV_LANDING_TOLERANCE_US) {
 		log_printf("decoder audio switch: invalid landing target=%llu ms audio=%u ms tolerance=%u ms; rejecting\n",
 		           (unsigned long long)position_ms,
 		           player->audio.first_packet_pts_ms,
-		           (unsigned)(VITA_SW_DECODER_AV_LANDING_TOLERANCE_US / 1000ULL));
+		           (unsigned)(VITA_SW_VIDEO_DECODER_AV_LANDING_TOLERANCE_US / 1000ULL));
 		stop_audio_candidate(player);
 		return AVERROR_INVALIDDATA;
 	}
-	vita_sw_elementary_audio_set_volume(&player->audio,
+	vita_audio_playback_set_volume(&player->audio,
 	                                    player->config.volume_percent);
 	player->audio.paused = player->paused;
 	uint64_t completed_us = sceKernelGetProcessTimeWide();
@@ -1054,7 +1051,7 @@ static int restart_audio_track(VitaSwDecoderPlayer *player, int audio_track,
 	return 0;
 }
 
-static void abandon_audio_replacement(VitaSwDecoderPlayer *player,
+static void abandon_audio_replacement(VitaSwVideoDecoderPlayer *player,
 	                                  uint64_t position_ms) {
 	stop_audio_candidate(player);
 	player->has_audio = 0;
@@ -1065,7 +1062,7 @@ static void abandon_audio_replacement(VitaSwDecoderPlayer *player,
 	__sync_synchronize();
 }
 
-static int restart_session_in_place(VitaSwDecoderPlayer *player,
+static int restart_session_in_place(VitaSwVideoDecoderPlayer *player,
 	                                uint64_t position_ms) {
 	uint64_t started_us = sceKernelGetProcessTimeWide();
 	int video_index = find_stream(player->video_input.format,
@@ -1077,7 +1074,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	if (audio_index >= 0 &&
 	    (!player->video_input.format ||
 	     (unsigned int)audio_index >= player->video_input.format->nb_streams ||
-	     !playable_aac_stream(player->video_input.format->streams[audio_index])))
+	     !playable_audio_stream(player->video_input.format->streams[audio_index])))
 		audio_index = -1;
 	if (video_index < 0 || (player->has_audio && audio_index < 0)) {
 		log_printf("decoder seek: stage=streams total=%llu ms ret=%d\n",
@@ -1092,7 +1089,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	input_publish_cancel(&player->video_input);
 	input_publish_cancel(&player->audio_input);
 	uint64_t stop_deadline = sceKernelGetProcessTimeWide() +
-	                         VITA_SW_DECODER_IO_STOP_GRACE_US;
+	                         VITA_SW_VIDEO_DECODER_IO_STOP_GRACE_US;
 	input_abort_after_grace(&player->video_input, player->video.started,
 	                        &player->video.thread_done, stop_deadline);
 	input_abort_after_grace(&player->audio_input, player->audio.started,
@@ -1104,7 +1101,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 			vita_sw_software_video_join(&player->video);
 	}
 	if (player->audio.started || player->audio.decoder_ready || player->audio.port_open)
-		vita_sw_elementary_audio_join(&player->audio);
+		vita_audio_playback_join(&player->audio);
 	uint64_t joined_us = sceKernelGetProcessTimeWide();
 	if (player->cancel && *player->cancel) return AVERROR_EXIT;
 	if (player->video_input.abort_invoked) {
@@ -1122,7 +1119,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		ret = reopen_audio_input(player, NULL, "audio-seek-reopen");
 		if (ret >= 0 &&
 		    ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-		     !playable_aac_stream(
+		     !playable_audio_stream(
 		         player->audio_input.format->streams[audio_index])))
 			ret = AVERROR_DECODER_NOT_FOUND;
 		if (ret >= 0 && position_ms > 0)
@@ -1161,7 +1158,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	}
 	if (player->has_audio) {
 		uint64_t audio_start_deadline = sceKernelGetProcessTimeWide() +
-		                                VITA_SW_DECODER_AUDIO_READY_DEADLINE_US;
+		                                VITA_SW_VIDEO_DECODER_AUDIO_READY_DEADLINE_US;
 		ret = start_audio_candidate(player, audio_index, position_ms, NULL,
 		                            audio_start_deadline);
 		if (ret < 0) {
@@ -1174,7 +1171,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 			                                1000ULL), ret);
 			return ret;
 		}
-		vita_sw_elementary_audio_set_volume(&player->audio,
+		vita_audio_playback_set_volume(&player->audio,
 		                                    player->config.volume_percent);
 		player->audio.paused = player->paused;
 	}
@@ -1235,7 +1232,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	}
 	uint64_t requested_us = position_ms * 1000ULL;
 	if (first_ready_pts_us > requested_us +
-	                         VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+	                         VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US) {
 		/* Returning a checked failure invokes the existing fresh-session recovery.
 		 * Never release audio behind a frame several seconds in the future: that is
 		 * the black-screen state observed after a live seek. */
@@ -1249,7 +1246,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		uint64_t audio_pts_us =
 		    (uint64_t)player->audio.first_packet_pts_ms * 1000ULL;
 		if (audio_pts_us > requested_us +
-		                   VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+		                   VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US) {
 			log_printf("decoder seek: invalid audio landing target=%llu ms audio=%u ms overshoot=%llu ms; reopening\n",
 			           (unsigned long long)position_ms,
 			           player->audio.first_packet_pts_ms,
@@ -1259,7 +1256,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 		uint64_t landing_delta_us = audio_pts_us > first_ready_pts_us
 		                           ? audio_pts_us - first_ready_pts_us
 		                           : first_ready_pts_us - audio_pts_us;
-		if (landing_delta_us > VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+		if (landing_delta_us > VITA_SW_VIDEO_DECODER_AV_LANDING_TOLERANCE_US) {
 			log_printf("decoder seek: A/V landing mismatch target=%llu ms video=%llu ms audio=%u ms delta=%llu ms; reopening\n",
 			           (unsigned long long)position_ms,
 			           (unsigned long long)(first_ready_pts_us / 1000ULL),
@@ -1283,7 +1280,7 @@ static int restart_session_in_place(VitaSwDecoderPlayer *player,
 	return 0;
 }
 
-static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms) {
+static int open_session(VitaSwVideoDecoderPlayer *player, uint64_t start_position_ms) {
 	uint64_t started_us = sceKernelGetProcessTimeWide();
 	int ret = 0;
 	player->cancel = player->config.cancel_flag
@@ -1321,7 +1318,7 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	           requested_audio_track, player->config.audio_track);
 	int video_index = find_stream(player->video_input.format,
 	                              AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_H264, 0);
-	int audio_index = player->audio_track_count > 0
+	int audio_index = player->config.audio_driver && player->audio_track_count > 0
 	                ? player->audio_tracks[player->config.audio_track].stream_index
 	                : -1;
 	if (video_index < 0) {
@@ -1358,7 +1355,7 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 			av_channel_layout_default(&params->ch_layout, (int)player->live_audio_channels);
 		}
 		if ((unsigned int)audio_index >= player->audio_input.format->nb_streams ||
-		    !playable_aac_stream(
+		    !playable_audio_stream(
 		        player->audio_input.format->streams[audio_index])) {
 			ret = AVERROR_DECODER_NOT_FOUND;
 			goto fail;
@@ -1446,11 +1443,11 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	if (ret < 0) goto fail;
 	if (player->has_audio) {
 		uint64_t audio_start_deadline = sceKernelGetProcessTimeWide() +
-		                                VITA_SW_DECODER_AUDIO_READY_DEADLINE_US;
+		                                VITA_SW_VIDEO_DECODER_AUDIO_READY_DEADLINE_US;
 		ret = start_audio_candidate(player, audio_index, start_position_ms, NULL,
 		                            audio_start_deadline);
 		if (ret < 0) goto fail;
-		vita_sw_elementary_audio_set_volume(&player->audio,
+		vita_audio_playback_set_volume(&player->audio,
 		                                    player->config.volume_percent);
 		player->audio.paused = player->paused;
 	}
@@ -1516,7 +1513,7 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 	}
 	uint64_t requested_us = start_position_ms * 1000ULL;
 	if (first_ready_pts_us > requested_us +
-	                         VITA_SW_DECODER_SEEK_OVERSHOOT_US) {
+	                         VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US) {
 		ret = AVERROR_INVALIDDATA;
 		log_printf("decoder startup: invalid video landing target=%llu ms video=%llu ms\n",
 		           (unsigned long long)start_position_ms,
@@ -1530,8 +1527,8 @@ static int open_session(VitaSwDecoderPlayer *player, uint64_t start_position_ms)
 		                           ? audio_pts_us - first_ready_pts_us
 		                           : first_ready_pts_us - audio_pts_us;
 		if (audio_pts_us > requested_us +
-		                   VITA_SW_DECODER_SEEK_OVERSHOOT_US ||
-		    landing_delta_us > VITA_SW_DECODER_AV_LANDING_TOLERANCE_US) {
+		                   VITA_SW_VIDEO_DECODER_SEEK_OVERSHOOT_US ||
+		    landing_delta_us > VITA_SW_VIDEO_DECODER_AV_LANDING_TOLERANCE_US) {
 			ret = AVERROR_INVALIDDATA;
 			log_printf("decoder startup: invalid A/V landing target=%llu ms video=%llu ms audio=%u ms delta=%llu ms\n",
 			           (unsigned long long)start_position_ms,
@@ -1560,12 +1557,12 @@ fail:
 	return ret;
 }
 
-VitaSwDecoderPlayer *vita_sw_decoder_create(void) {
-	return calloc(1, sizeof(VitaSwDecoderPlayer));
+VitaSwVideoDecoderPlayer *vita_sw_video_decoder_create(void) {
+	return calloc(1, sizeof(VitaSwVideoDecoderPlayer));
 }
 
-static int decoder_open_mode(VitaSwDecoderPlayer *player,
-	                    const VitaSwDecoderPlayerConfig *config, int live,
+static int decoder_open_mode(VitaSwVideoDecoderPlayer *player,
+	                    const VitaSwVideoDecoderPlayerConfig *config, int live,
 	                    uint32_t audio_rate, uint32_t audio_channels) {
 	if (!player || !config ||
 	    (!config->stream.open && !config->stream.open_with_cancel))
@@ -1586,14 +1583,14 @@ static int decoder_open_mode(VitaSwDecoderPlayer *player,
 	return ret;
 }
 
-int vita_sw_decoder_open(VitaSwDecoderPlayer *player,
-    const VitaSwDecoderPlayerConfig *config) {
+int vita_sw_video_decoder_open(VitaSwVideoDecoderPlayer *player,
+    const VitaSwVideoDecoderPlayerConfig *config) {
 	return decoder_open_mode(player, config, 0, 0, 0);
 }
 
-int vita_sw_decoder_open_live(VitaSwDecoderPlayer *player,
-    const VitaSwDecoderPlayerConfig *config,
-    const VitaSwDecoderLiveOptions *options) {
+int vita_sw_video_decoder_open_live(VitaSwVideoDecoderPlayer *player,
+    const VitaSwVideoDecoderPlayerConfig *config,
+    const VitaSwVideoDecoderLiveOptions *options) {
 	if (!options || options->size != sizeof(*options) ||
 	    (options->version != 1 && options->version != 2) || !config ||
 	    config->start_position_ms || config->audio_track)
@@ -1607,31 +1604,31 @@ int vita_sw_decoder_open_live(VitaSwDecoderPlayer *player,
 	return decoder_open_mode(player, config, 2, options->audio.sample_rate, options->audio.channels);
 }
 
-void vita_sw_decoder_close(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_close(VitaSwVideoDecoderPlayer *player) {
 	close_session(player);
 }
 
-void vita_sw_decoder_destroy(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_destroy(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	close_session(player);
 	free(player);
 }
 
-void vita_sw_decoder_set_paused(VitaSwDecoderPlayer *player, int paused) {
+void vita_sw_video_decoder_set_paused(VitaSwVideoDecoderPlayer *player, int paused) {
 	if (!player) return;
 	player->paused = paused != 0;
 	player->audio.paused = player->paused;
 	player->clock_wall_us = sceKernelGetProcessTimeWide();
 }
 
-void vita_sw_decoder_set_volume(VitaSwDecoderPlayer *player, int percent) {
+void vita_sw_video_decoder_set_volume(VitaSwVideoDecoderPlayer *player, int percent) {
 	if (!player) return;
 	percent = vita_audio_volume_clamp(percent);
 	player->config.volume_percent = percent;
-	vita_sw_elementary_audio_set_volume(&player->audio, percent);
+	vita_audio_playback_set_volume(&player->audio, percent);
 }
 
-void vita_sw_decoder_request_stop(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_request_stop(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	if (player->cancel) *player->cancel = 1;
 	__atomic_store_n(&player->video.stop,1,__ATOMIC_RELEASE);
@@ -1641,7 +1638,7 @@ void vita_sw_decoder_request_stop(VitaSwDecoderPlayer *player) {
 	input_cancel_and_abort(&player->audio_input);
 }
 
-void vita_sw_decoder_prepare_background_restart(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_prepare_background_restart(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	/* The caller's GXM fence and presentation exclusion happen-before the
 	 * restart worker observes this one-shot mark. */
@@ -1650,7 +1647,7 @@ void vita_sw_decoder_prepare_background_restart(VitaSwDecoderPlayer *player) {
 	__sync_synchronize();
 }
 
-void vita_sw_decoder_interrupt_audio_operation(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_interrupt_audio_operation(VitaSwVideoDecoderPlayer *player) {
 	if (!player) return;
 	audio_operation_lock(player);
 	/* The UI publishes its caller flag only after this phase-specific interrupt,
@@ -1664,7 +1661,7 @@ void vita_sw_decoder_interrupt_audio_operation(VitaSwDecoderPlayer *player) {
 	audio_operation_unlock(player);
 }
 
-int vita_sw_decoder_seek(VitaSwDecoderPlayer *player, uint64_t position_ms) {
+int vita_sw_video_decoder_seek(VitaSwVideoDecoderPlayer *player, uint64_t position_ms) {
 	if (!player || !player->opened) return AVERROR(EINVAL);
 	if (player->live_input) return AVERROR(ENOSYS);
 	int video_index = find_stream(player->video_input.format,
@@ -1723,12 +1720,12 @@ int vita_sw_decoder_seek(VitaSwDecoderPlayer *player, uint64_t position_ms) {
 	return recovery_ret;
 }
 
-int vita_sw_decoder_select_audio_track_with_cancel(
-	VitaSwDecoderPlayer *player, int audio_track, uint64_t position_ms,
+int vita_sw_video_decoder_select_audio_track_with_cancel(
+	VitaSwVideoDecoderPlayer *player, int audio_track, uint64_t position_ms,
 	volatile int *operation_cancel) {
 	if (!player || !player->opened || audio_track < 0 ||
 	    audio_track >= player->audio_track_count) return AVERROR(EINVAL);
-	if (player->live_input) return AVERROR(ENOSYS);
+	if (player->live_input || !player->config.audio_driver) return AVERROR(ENOSYS);
 	if (audio_track == player->config.audio_track) return 0;
 	if (operation_cancel && *operation_cancel) return AVERROR_EXIT;
 	if (player->duration_ms && position_ms >= player->duration_ms) {
@@ -1752,8 +1749,8 @@ int vita_sw_decoder_select_audio_track_with_cancel(
 		log_printf("decoder audio switch: reject track=%d position=%llu ms stream-end=%llu ms unchanged=%d\n",
 		           audio_track, (unsigned long long)position_ms,
 		           (unsigned long long)selected_end_ms,
-		           VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK);
-		return VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK;
+		           VITA_SW_VIDEO_DECODER_AUDIO_CHANGE_ROLLED_BACK);
+		return VITA_SW_VIDEO_DECODER_AUDIO_CHANGE_ROLLED_BACK;
 	}
 	int previous_track = player->config.audio_track;
 	log_printf("decoder audio transaction: begin prior=%d requested=%d target=%llu ms\n",
@@ -1782,7 +1779,7 @@ int vita_sw_decoder_select_audio_track_with_cancel(
 			log_printf("decoder audio rollback: prior track=%d restored forward-ret=%d",
 			           previous_track, ret);
 			return ret == AVERROR_EXIT
-			     ? AVERROR_EXIT : VITA_SW_DECODER_AUDIO_CHANGE_ROLLED_BACK;
+			     ? AVERROR_EXIT : VITA_SW_VIDEO_DECODER_AUDIO_CHANGE_ROLLED_BACK;
 		}
 		restore_ret = AVERROR_EXIT;
 		abandon_audio_replacement(player, position_ms);
@@ -1799,39 +1796,39 @@ int vita_sw_decoder_select_audio_track_with_cancel(
 	return restore_ret;
 }
 
-int vita_sw_decoder_select_audio_track(VitaSwDecoderPlayer *player,
+int vita_sw_video_decoder_select_audio_track(VitaSwVideoDecoderPlayer *player,
 	                                   int audio_track,
 	                                   uint64_t position_ms) {
-	return vita_sw_decoder_select_audio_track_with_cancel(
+	return vita_sw_video_decoder_select_audio_track_with_cancel(
 	    player, audio_track, position_ms, NULL);
 }
 
-int vita_sw_decoder_audio_track_count(const VitaSwDecoderPlayer *player) {
+int vita_sw_video_decoder_audio_track_count(const VitaSwVideoDecoderPlayer *player) {
 	return player ? player->audio_track_count : 0;
 }
 
-int vita_sw_decoder_subtitle_track_count(const VitaSwDecoderPlayer *player) {
+int vita_sw_video_decoder_subtitle_track_count(const VitaSwVideoDecoderPlayer *player) {
 	return player ? player->subtitle_track_count : 0;
 }
 
-int vita_sw_decoder_audio_track_info(const VitaSwDecoderPlayer *player,
-	                                 int index, VitaSwDecoderTrackInfo *info) {
+int vita_sw_video_decoder_audio_track_info(const VitaSwVideoDecoderPlayer *player,
+	                                 int index, VitaSwVideoDecoderTrackInfo *info) {
 	if (!player || !info || index < 0 || index >= player->audio_track_count)
 		return AVERROR(EINVAL);
 	*info = player->audio_tracks[index];
 	return 0;
 }
 
-int vita_sw_decoder_subtitle_track_info(const VitaSwDecoderPlayer *player,
+int vita_sw_video_decoder_subtitle_track_info(const VitaSwVideoDecoderPlayer *player,
 	                                    int index,
-	                                    VitaSwDecoderTrackInfo *info) {
+	                                    VitaSwVideoDecoderTrackInfo *info) {
 	if (!player || !info || index < 0 || index >= player->subtitle_track_count)
 		return AVERROR(EINVAL);
 	*info = player->subtitle_tracks[index];
 	return 0;
 }
 
-static int audio_is_clock_master(const VitaSwDecoderPlayer *player) {
+static int audio_is_clock_master(const VitaSwVideoDecoderPlayer *player) {
 	int clean_eof = player->has_audio && player->audio.eof &&
 	                !player->audio.had_error;
 	/* The audio worker publishes its final accepted-sample clock before eof. Pair
@@ -1840,14 +1837,14 @@ static int audio_is_clock_master(const VitaSwDecoderPlayer *player) {
 	return player->has_audio && !clean_eof;
 }
 
-static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
+static uint64_t presentation_clock(VitaSwVideoDecoderPlayer *player) {
 	uint64_t now = sceKernelGetProcessTimeWide();
 	if (!audio_is_clock_master(player)) {
 		/* clock_us was continuously shadowing the audio clock before EOF. Keep the
 		 * larger value at handoff, then advance from the same wall timestamp so the
 		 * video tail neither freezes nor jumps backwards. */
 		uint64_t raw = player->has_audio
-		             ? vita_sw_elementary_audio_clock_us(&player->audio) : 0;
+		             ? vita_audio_playback_clock_us(&player->audio) : 0;
 		if (raw > player->clock_us) player->clock_us = raw;
 		if (player->has_audio && player->audio.eof &&
 		    !player->audio.had_error && !player->audio_clock_handed_off) {
@@ -1866,7 +1863,7 @@ static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
 		if (!player->paused) player->clock_us += delta;
 		return player->clock_us;
 	}
-	uint64_t raw = vita_sw_elementary_audio_clock_us(&player->audio);
+	uint64_t raw = vita_audio_playback_clock_us(&player->audio);
 	if (!raw) {
 		/* A newly opened AudioOut port has not completed its first blocking grain
 		 * yet. Keep the verified seek/switch target instead of collapsing the public
@@ -1884,31 +1881,31 @@ static uint64_t presentation_clock(VitaSwDecoderPlayer *player) {
 	uint64_t delta = now - player->clock_wall_us;
 	player->clock_wall_us = now;
 	if (!player->paused) player->clock_us += delta;
-	uint64_t minimum = raw > VITA_SW_DECODER_CLOCK_WINDOW_US
-	                 ? raw - VITA_SW_DECODER_CLOCK_WINDOW_US : 0;
-	uint64_t maximum = raw + VITA_SW_DECODER_CLOCK_WINDOW_US;
+	uint64_t minimum = raw > VITA_SW_VIDEO_DECODER_CLOCK_WINDOW_US
+	                 ? raw - VITA_SW_VIDEO_DECODER_CLOCK_WINDOW_US : 0;
+	uint64_t maximum = raw + VITA_SW_VIDEO_DECODER_CLOCK_WINDOW_US;
 	if (player->clock_us < minimum) player->clock_us = minimum;
 	if (player->clock_us > maximum) player->clock_us = maximum;
 	return player->clock_us;
 }
 
-int vita_sw_decoder_present(VitaSwDecoderPlayer *player, int fill_screen) {
+int vita_sw_video_decoder_present(VitaSwVideoDecoderPlayer *player, int fill_screen) {
 	if (!player || !player->opened) return 0;
 	uint64_t clock = presentation_clock(player);
 	uint64_t raw = audio_is_clock_master(player)
-	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
+	             ? vita_audio_playback_clock_us(&player->audio) : clock;
 	if (!raw) raw = clock;
 	return vita_sw_software_video_present(&player->video, clock, raw,
 	                              fill_screen, !player->paused);
 }
 
-int vita_sw_decoder_present_rect(VitaSwDecoderPlayer *player,
+int vita_sw_video_decoder_present_rect(VitaSwVideoDecoderPlayer *player,
 	                            float x, float y, float width, float height,
 	                            int fill_rect) {
 	if (!player || !player->opened) return 0;
 	uint64_t clock = presentation_clock(player);
 	uint64_t raw = audio_is_clock_master(player)
-	             ? vita_sw_elementary_audio_clock_us(&player->audio) : clock;
+	             ? vita_audio_playback_clock_us(&player->audio) : clock;
 	if (!raw) raw = clock;
 	return vita_sw_software_video_present_rect(&player->video,
 	                                   clock, raw,
@@ -1916,23 +1913,23 @@ int vita_sw_decoder_present_rect(VitaSwDecoderPlayer *player,
 	                                   !player->paused);
 }
 
-void vita_sw_decoder_discard_video_to_clock(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_discard_video_to_clock(VitaSwVideoDecoderPlayer *player) {
 	if (!player || !player->opened) return;
 	uint64_t clock = presentation_clock(player);
 	vita_sw_software_video_discard_to_clock(&player->video, clock);
 }
 
-void vita_sw_decoder_render_complete(VitaSwDecoderPlayer *player) {
+void vita_sw_video_decoder_render_complete(VitaSwVideoDecoderPlayer *player) {
 	if (player && player->opened) vita_sw_software_video_render_complete(&player->video);
 }
 
-int vita_sw_decoder_presented_time(VitaSwDecoderPlayer *player,uint64_t *pts_us){
+int vita_sw_video_decoder_presented_time(VitaSwVideoDecoderPlayer *player,uint64_t *pts_us){
  if(pts_us)*pts_us=0;
  if(!player||!player->opened||!pts_us)return 0;
  int have=0;vita_sw_software_video_buffer_status(&player->video,NULL,&have,pts_us);return have;
 }
-void vita_sw_decoder_get_status(VitaSwDecoderPlayer *player,
-	                           VitaSwDecoderPlayerStatus *status) {
+void vita_sw_video_decoder_get_status(VitaSwVideoDecoderPlayer *player,
+	                           VitaSwVideoDecoderPlayerStatus *status) {
 	if (!status) return;
 	memset(status, 0, sizeof(*status));
 	if (!player) return;

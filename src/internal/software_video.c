@@ -74,8 +74,8 @@ static int hardware_raster_supported(uint32_t width, uint32_t height) {
 #define SOFTWARE_VIDEO_HARDWARE_DIRECT_ENABLED 1
 #endif
 
-#ifndef VITA_SW_DECODER_HAS_H264_VITA
-#define VITA_SW_DECODER_HAS_H264_VITA 0
+#ifndef VITA_SW_VIDEO_DECODER_HAS_H264_VITA
+#define VITA_SW_VIDEO_DECODER_HAS_H264_VITA 0
 #endif
 
 enum {
@@ -198,7 +198,7 @@ static int zero_copy_get_buffer2(AVCodecContext *decoder, AVFrame *frame,
 	if (!st || !st->zero_copy) return AVERROR(EINVAL);
 	if (frame->format != AV_PIX_FMT_YUV420P &&
 	    frame->format != AV_PIX_FMT_YUVJ420P
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
 	    && frame->format != AV_PIX_FMT_VITA_YUV420P
 	    && frame->format != AV_PIX_FMT_VITA_NV12
 #endif
@@ -648,7 +648,7 @@ static int open_h264_decoder(SoftwareVideoState *st, AVStream *stream,
 		decoder->thread_count = 1;
 		decoder->thread_type = 0;
 		if (st->hardware_direct_available) {
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
 			/* Exact representation used by wiliwili's public GXM backend. */
 			decoder->pix_fmt = AV_PIX_FMT_VITA_NV12;
 			decoder->opaque = st;
@@ -767,7 +767,7 @@ static void *vita_sw_software_video_thread(void *argp) {
 	} else {
 		AVStream *stream = st->demux->streams[st->stream_index];
 		const AVCodec *hardware_codec = NULL;
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
 		if (st->hardware_runtime_ready)
 			hardware_codec = avcodec_find_decoder_by_name("h264_vita");
 #endif
@@ -899,7 +899,7 @@ static int allocate_copy_ring(SoftwareVideoState *st) {
 	for (int i = 0; i < SOFTWARE_VIDEO_COPY_FRAME_SLOTS; i++) {
         if(st->slots[i].pixels)continue;
 		char name[32];
-		snprintf(name, sizeof(name), "VitaSwDecoderSwFrame%d", i);
+		snprintf(name, sizeof(name), "VitaSwVideoDecoderSwFrame%d", i);
 		st->slots[i].allocation_size = ALIGN_UP_U32(st->frame_bytes,
 		                                                CDRAM_ALIGNMENT);
 		st->slots[i].pixels = allocate_cdram(name, st->frame_bytes,
@@ -919,7 +919,7 @@ static __attribute__((unused)) int allocate_zero_copy_pool(SoftwareVideoState *s
 	}
 	for (int i = 0; i < active_surface_count(st); i++) {
 		char name[32];
-		snprintf(name, sizeof(name), "VitaSwDecoderZeroYuv%d", i);
+		snprintf(name, sizeof(name), "VitaSwVideoDecoderZeroYuv%d", i);
 		SoftwareVideoZeroSurface *surface = &st->zero_surfaces[i];
 		surface->allocation_size = ALIGN_UP_U32(st->frame_bytes,
 		                                            CDRAM_ALIGNMENT);
@@ -999,11 +999,11 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	}
 	st->continuous_high_fps = st->source_fps >= 50 &&
 	                          (uint64_t)width * height >= 1280ULL * 640ULL;
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
 	/* ReAvPlayer is already a process-lifetime dependency of the working 360p
 	 * path. Load the shared codec runtime before the h264_vita thread, while
 	 * leaving h264_vita itself in sole ownership of the SceVideodec lifecycle. */
-	int hardware_prepare_ret = vita_sw_decoder_runtime_prepare();
+	int hardware_prepare_ret = vita_sw_video_decoder_runtime_prepare();
 	if (hardware_prepare_ret >= 0) {
 		st->hardware_runtime_ready = 1;
 	} else {
@@ -1020,7 +1020,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
 	 * the CPU copy fallback writes only visible rows and does not need to mirror
 	 * libavcodec's private SIMD allocation envelope. */
 	st->texture_height = ALIGN_UP_U32(height, 16);
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
     /* The upstream hardware contract uses at least 64 decoded rows/columns.
      * A smaller NV12 height places UV over the hardware luma output. */
     if(st->hardware_runtime_ready){
@@ -1037,7 +1037,7 @@ int vita_sw_software_video_start(SoftwareVideoState *st, AVFormatContext *demux,
     for(int i=0;i<SOFTWARE_VIDEO_ZERO_COPY_SURFACES;i++)
         st->zero_surfaces[i].release_event=st->frame_event;
 
-#if VITA_SW_DECODER_HAS_H264_VITA
+#if VITA_SW_VIDEO_DECODER_HAS_H264_VITA
 	if (SOFTWARE_VIDEO_HARDWARE_DIRECT_ENABLED && st->hardware_runtime_ready) {
 		buffer_ret = allocate_zero_copy_pool(st);
 		if (buffer_ret >= 0) {

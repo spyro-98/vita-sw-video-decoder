@@ -7,9 +7,9 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 ffmpeg_version=8.1.2
 ffmpeg_sha256=464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
 ffmpeg_url="https://ffmpeg.org/releases/ffmpeg-${ffmpeg_version}.tar.xz"
-prefix="${VITA_SW_DECODER_FFMPEG_ROOT:-$repo_root/build/deps/ffmpeg-vita-sw}"
-jobs="${VITA_SW_DECODER_FFMPEG_JOBS:-4}"
-work="$(mktemp -d "${TMPDIR:-/tmp}/vita-sw-decoder-ffmpeg.XXXXXX")"
+prefix="${VITA_SW_VIDEO_DECODER_FFMPEG_ROOT:-$repo_root/build/deps/ffmpeg-vita-sw}"
+jobs="${VITA_SW_VIDEO_DECODER_FFMPEG_JOBS:-4}"
+work="$(mktemp -d "${TMPDIR:-/tmp}/vita-sw-video-decoder-ffmpeg.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
 curl -L --fail --max-time 180 "$ffmpeg_url" -o "$work/ffmpeg.tar.xz"
@@ -24,10 +24,10 @@ cd "$work/ffmpeg-${ffmpeg_version}"
   --ar="$VITASDK/bin/arm-vita-eabi-gcc-ar" \
   --ranlib="$VITASDK/bin/arm-vita-eabi-gcc-ranlib" \
   --nm="$VITASDK/bin/arm-vita-eabi-gcc-nm" \
-  --disable-shared --enable-static --disable-runtime-cpudetect \
+  --disable-shared --enable-static --enable-swresample --disable-runtime-cpudetect \
   --disable-programs --disable-doc --disable-network --disable-everything \
-  --enable-decoder=h264 --enable-demuxer=mov,matroska,mpegts \
-  --enable-parser=aac,h264 --enable-protocol=file \
+  --enable-decoder=h264,aac,ac3,mp3float --enable-demuxer=mov,matroska,mpegts \
+  --enable-parser=aac,h264,ac3,mpegaudio --enable-protocol=file \
   --disable-debug --enable-hardcoded-tables --enable-lto \
   --arch=armv7-a --cpu=cortex-a9 --target-os=none \
   --disable-armv5te --disable-armv6t2 --enable-pthreads \

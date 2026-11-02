@@ -1,4 +1,4 @@
-# vita-sw-decoder third-party notices
+# vita-sw-video-decoder third-party notices
 
 The module is distributed under GPL-3.0-only; see `LICENSE`.
 
